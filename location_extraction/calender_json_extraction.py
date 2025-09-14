@@ -1,8 +1,65 @@
 import json
 import re
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import os
+import httpx
+
+# ---- Geocoding Helper Functions ----
+
+def geocode_location(location: str) -> Optional[Tuple[float, float]]:
+    """
+    Convert a location string to latitude/longitude using free OpenStreetMap Nominatim.
+    
+    Parameters
+    ----------
+    location : str
+        The location string to geocode (e.g., "New York, NY", "Bushwick Country Club")
+    
+    Returns
+    -------
+    Optional[Tuple[float, float]]
+        A tuple of (latitude, longitude) in decimal degrees, or None if geocoding fails.
+        Latitude range: -90.0 to 90.0
+        Longitude range: -180.0 to 180.0
+    """
+    if not location or location.strip() == "":
+        return None
+    
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": location,
+        "format": "json",
+        "limit": 1
+    }
+    headers = {
+        "User-Agent": "HiddenHealthMarkerHunting/1.0"  # Required by Nominatim
+    }
+    
+    try:
+        response = httpx.get(url, params=params, headers=headers)
+        data = response.json()
+        
+        if data and len(data) > 0:
+            result = data[0]
+            lat = float(result["lat"])
+            lng = float(result["lon"])
+            return (lat, lng)
+        else:
+            print(f"No results found for '{location}'")
+            return None
+            
+    except Exception as e:
+        print(f"Error geocoding '{location}': {e}")
+        return None
+
+# ---- Exports ----
+__all__ = [
+    "geocode_location",
+    "ICalendarParser", 
+    "extract_calendar_data", 
+    "oprate_calendar_data"
+]
 
 class ICalendarParser:
     def __init__(self, ics_file_path: str):
@@ -253,18 +310,59 @@ def oprate_calendar_data(ics_file: str):
         # Parse the calendar data
         calendar_data = parser.parse_icalendar()
 
-
         # extract events from the calendar data
+        events = calendar_data["events"]
 
-        # output format i need
+        event_data_extracted = []
+        for event in events[:100]:
+            # extract the location from the event
+            location = event["location"]
+            # extract the start time from the event
+            start_time = event["start_time"]
+            # extract the end time from the event
+            end_time = event["end_time"]
 
+            # geocode the location
+            coordinates = geocode_location(location)
+            if coordinates:
+                lat, lon = coordinates
+                print(f"'{location}' -> Lat: {lat:.6f}, Lon: {lon:.6f}")
+            else:
+                print(f"'{location}' -> Could not geocode")
+            
+            # extract the date from the start time
+            # Convert start time to YYYY-MM-DD format
+            if start_time:
+                try:
+                    # Parse the ISO format datetime string
+                    dt = datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ")
+                    # Format as YYYY-MM-DD
+                    date_str = dt.strftime("%Y-%m-%d")
+                    print(f"Date: {date_str}")
+                except ValueError as e:
+                    print(f"Error parsing start time {start_time}: {e}")
+                    date_str = None
+            else:
+                date_str = None
 
+            # Create output dict for this event
+            if coordinates and date_str:
+                event_data = {
+                    "lat": lat,
+                    "lon": lon, 
+                    "date_str": date_str
+                }
+                print(f"Event data: {event_data}")
+                event_data_extracted.append(event_data)
         
-        return  calendar_data
+        print(f"Event data extracted: {event_data_extracted}")
+
+        return event_data_extracted
         
     except Exception as e:
         print(f"Error processing calendar data: {str(e)}")
 
 
 if __name__ == "__main__":
+    # Run the main calendar processing
     oprate_calendar_data(ics_file = "../data/calender_data_2.ics")
