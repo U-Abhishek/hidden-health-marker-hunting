@@ -75,3 +75,5 @@ Thumbs.db
 
 # Ignore all files in the data directory
 data/
+
+frontend/node_modules/
