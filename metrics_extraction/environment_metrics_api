@@ -1,0 +1,310 @@
+"""
+FastAPI endpoint that returns environmental conditions for a given
+latitude, longitude, and date.
+
+It aggregates:
+  • Google Maps Air Quality API (current, forecast, or history depending on date)
+  • Open‑Meteo (UV index, temperature, humidity, wind, etc.; free, no API key)
+  • OpenUV (optional; if OPENUV_API_KEY is set)
+
+Setup
+-----
+1) Python deps (suggested minimal):
+   pip install fastapi uvicorn httpx python-dateutil pydantic
+
+2) Env vars:
+   export GOOGLE_MAPS_API_KEY=YOUR_KEY
+   # optional
+   export OPENUV_API_KEY=YOUR_KEY
+
+Run
+---
+   uvicorn env_conditions_api:app --reload --port 8080
+
+Example
+-------
+   curl "http://localhost:8080/env?lat=40.7128&lon=-74.0060&date=2025-09-14"
+
+Notes
+-----
+• Google Air Quality “forecast:lookup” supports future up to 96h; “history:lookup” supports past 30 days.
+• Open‑Meteo automatically chooses models; use historical host for past dates (>=2022).
+• Time handling: we return the full UTC day for the requested date, and also try to pick a representative hour (local noon) when helpful.
+"""
+from __future__ import annotations
+
+import os
+import math
+import asyncio
+from datetime import datetime, date as date_cls, timedelta, timezone
+from typing import Any, Dict, Optional
+
+import httpx
+from fastapi import FastAPI, Query, HTTPException
+from pydantic import BaseModel, Field
+from dateutil import tz
+
+GOOGLE_AIR_BASE = "https://airquality.googleapis.com/v1"
+OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_HISTORICAL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+OPENUV_BASE = "https://api.openuv.io/api/v1/uv"
+
+app = FastAPI(title="Environmental Conditions API", version="1.0.0")
+
+
+class EnvResponse(BaseModel):
+    location: Dict[str, Any]
+    date: str
+    timezone: str
+    google_air_quality: Dict[str, Any]
+    weather: Dict[str, Any]
+    uv_extra: Optional[Dict[str, Any]] = None
+    sources: Dict[str, str]
+
+
+def _parse_date(d: Optional[str]) -> date_cls:
+    if d is None:
+        # default to today in user's local tz; we use America/New_York as a sane default if unknown
+        tzinfo = tz.gettz(os.environ.get("LOCAL_TZ", "America/New_York"))
+        return datetime.now(tzinfo).date()
+    try:
+        return datetime.fromisoformat(d).date()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format. Use YYYY-MM-DD. ({e})")
+
+
+def _day_utc_window(day: date_cls) -> tuple[datetime, datetime]:
+    # Represent the given calendar date as a UTC window [start, end)
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return start, end
+
+
+def _closest_hour_idx(times: list[str], target_iso: str) -> int:
+    # times are ISO8601 strings; return index closest to target
+    t_target = datetime.fromisoformat(target_iso.replace("Z", "+00:00"))
+    diffs = []
+    for i, t in enumerate(times):
+        ti = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        diffs.append((abs((ti - t_target).total_seconds()), i))
+    diffs.sort()
+    return diffs[0][1] if diffs else 0
+
+
+async def fetch_google_air_quality(lat: float, lon: float, day: date_cls, *, client: httpx.AsyncClient) -> Dict[str, Any]:
+    key = os.getenv("GOOGLE_MAPS_API_KEY")
+    if not key:
+        return {"error": "Missing GOOGLE_MAPS_API_KEY"}
+
+    start_utc, end_utc = _day_utc_window(day)
+    now_utc = datetime.now(timezone.utc)
+
+    payload_common = {
+        "location": {"latitude": lat, "longitude": lon},
+        "languageCode": "en",
+        "universalAqi": True,
+        "extraComputations": [
+            "HEALTH_RECOMMENDATIONS",
+            "DOMINANT_POLLUTANT_CONCENTRATION",
+            "POLLUTANT_CONCENTRATION",
+            "POLLUTANT_ADDITIONAL_INFO",
+            "LOCAL_AQI",
+        ],
+    }
+
+    out: Dict[str, Any] = {"used": []}
+
+    # 1) current conditions (only if the requested day is today)
+    if start_utc.date() == now_utc.date():
+        try:
+            r = await client.post(
+                f"{GOOGLE_AIR_BASE}/currentConditions:lookup",
+                params={"key": key},
+                json=payload_common,
+                timeout=15,
+            )
+            r.raise_for_status()
+            out["current"] = r.json()
+            out["used"].append("currentConditions:lookup")
+        except Exception as e:
+            out["current_error"] = str(e)
+
+    # 2) history (if within past 30 days)
+    if end_utc <= now_utc and (now_utc - start_utc) <= timedelta(days=30):
+        body = {
+            **payload_common,
+            "period": {
+                "startTime": start_utc.isoformat().replace("+00:00", "Z"),
+                "endTime": end_utc.isoformat().replace("+00:00", "Z"),
+            },
+            "pageSize": 200,
+        }
+        try:
+            r = await client.post(
+                f"{GOOGLE_AIR_BASE}/history:lookup",
+                params={"key": key},
+                json=body,
+                timeout=20,
+            )
+            r.raise_for_status()
+            out["history"] = r.json()
+            out["used"].append("history:lookup")
+        except Exception as e:
+            out["history_error"] = str(e)
+
+    # 3) forecast (if today/future within 96h)
+    if start_utc >= now_utc - timedelta(hours=1):
+        # The API needs a start dateTime in the future for forecast; we use the next hour if start is in the past.
+        start_dt = max(now_utc + timedelta(hours=1), start_utc)
+        body = {
+            **payload_common,
+            "dateTime": start_dt.isoformat().replace("+00:00", "Z"),
+            "pageSize": 200,
+        }
+        try:
+            r = await client.post(
+                f"{GOOGLE_AIR_BASE}/forecast:lookup",
+                params={"key": key},
+                json=body,
+                timeout=20,
+            )
+            r.raise_for_status()
+            out["forecast"] = r.json()
+            out["used"].append("forecast:lookup")
+        except Exception as e:
+            out["forecast_error"] = str(e)
+
+    return out
+
+
+async def fetch_open_meteo(lat: float, lon: float, day: date_cls, *, client: httpx.AsyncClient) -> Dict[str, Any]:
+    # Use historical host for past dates; standard for today/future
+    today_utc = datetime.now(timezone.utc).date()
+    base = OPEN_METEO_FORECAST if day >= today_utc else OPEN_METEO_HISTORICAL
+    start = day.isoformat()
+    end = day.isoformat()
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": ",".join([
+            "temperature_2m",
+            "relative_humidity_2m",
+            "dew_point_2m",
+            "apparent_temperature",
+            "precipitation",
+            "cloudcover",
+            "wind_speed_10m",
+            "uv_index",
+            "uv_index_clear_sky",
+        ]),
+        "daily": ",".join([
+            "uv_index_max",
+            "uv_index_clear_sky_max",
+        ]),
+        "timezone": "auto",
+        "start_date": start,
+        "end_date": end,
+    }
+    try:
+        r = await client.get(base, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+    # Pick a representative hour near local noon if available
+    try:
+        if "hourly" in data and "time" in data["hourly"]:
+            times = data["hourly"]["time"]
+            # local noon approximation: pick 12:00 of the day in returned timezone if present
+            tzname = data.get("timezone", "UTC")
+            local_noon = datetime.combine(day, datetime.min.time()).replace(tzinfo=tz.gettz(tzname)) + timedelta(hours=12)
+            idx = _closest_hour_idx(times, local_noon.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"))
+            hourly_sample = {k: (v[idx] if isinstance(v, list) and len(v) > idx else None) for k, v in data["hourly"].items() if k != "time"}
+        else:
+            hourly_sample = None
+    except Exception:
+        hourly_sample = None
+
+    return {
+        "source": base,
+        "params": params,
+        "raw": data,
+        "sample_at_local_noon": hourly_sample,
+    }
+
+
+async def fetch_openuv(lat: float, lon: float, day: date_cls, *, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    key = os.getenv("OPENUV_API_KEY")
+    if not key:
+        return None
+    # OpenUV allows optional dt (ISO8601). We'll query at local noon for that day to get representative UV.
+    # If the day is today, also query "now".
+    # Build dt in UTC for noon local time
+    local_tz = tz.gettz(os.environ.get("LOCAL_TZ", "America/New_York"))
+    local_noon = datetime.combine(day, datetime.min.time()).replace(tzinfo=local_tz) + timedelta(hours=12)
+    dt_param = local_noon.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    headers = {"x-access-token": key}
+    try:
+        r = await client.get(OPENUV_BASE, params={"lat": lat, "lng": lon, "dt": dt_param}, headers=headers, timeout=15)
+        r.raise_for_status()
+        uv_noon = r.json()
+    except Exception as e:
+        uv_noon = {"error": str(e)}
+
+    uv_now = None
+    today_local = datetime.now(local_tz).date()
+    if day == today_local:
+        try:
+            r2 = await client.get(OPENUV_BASE, params={"lat": lat, "lng": lon}, headers=headers, timeout=15)
+            r2.raise_for_status()
+            uv_now = r2.json()
+        except Exception as e:
+            uv_now = {"error": str(e)}
+
+    return {"noon": uv_noon, "now": uv_now}
+
+
+@app.get("/env", response_model=EnvResponse)
+async def get_environment(
+    lat: float = Query(..., description="Latitude in decimal degrees"),
+    lon: float = Query(..., description="Longitude in decimal degrees"),
+    date: Optional[str] = Query(None, description="Date in YYYY-MM-DD (defaults to today)"),
+):
+    d = _parse_date(date)
+
+    # Basic sanity checks
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise HTTPException(status_code=400, detail="Invalid latitude/longitude range")
+
+    async with httpx.AsyncClient() as client:
+        g_task = asyncio.create_task(fetch_google_air_quality(lat, lon, d, client=client))
+        w_task = asyncio.create_task(fetch_open_meteo(lat, lon, d, client=client))
+        u_task = asyncio.create_task(fetch_openuv(lat, lon, d, client=client))
+
+        g, w, u = await asyncio.gather(g_task, w_task, u_task)
+
+    # Compose response
+    tzname = w.get("raw", {}).get("timezone", "auto") if isinstance(w, dict) else "auto"
+
+    return EnvResponse(
+        location={"latitude": lat, "longitude": lon},
+        date=d.isoformat(),
+        timezone=tzname,
+        google_air_quality=g if isinstance(g, dict) else {"error": "google_air_quality fetch failed"},
+        weather={k: v for k, v in w.items() if k in ("source", "params", "raw", "sample_at_local_noon")} if isinstance(w, dict) else {"error": "open-meteo fetch failed"},
+        uv_extra=u,
+        sources={
+            "google_air_quality": f"{GOOGLE_AIR_BASE}/(currentConditions|forecast|history)",
+            "open_meteo": (OPEN_METEO_FORECAST if d >= datetime.now(timezone.utc).date() else OPEN_METEO_HISTORICAL),
+            "openuv": OPENUV_BASE,
+        },
+    )
+
+
+# Health check
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
