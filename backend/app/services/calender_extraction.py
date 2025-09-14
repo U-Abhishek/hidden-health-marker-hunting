@@ -361,7 +361,7 @@ def oprate_calendar_data(ics_file: str):
         print(f"Error processing calendar data: {str(e)}")
 
 
-if __name__ == "__main__":
-    # Run the main calendar processing
-    event_data_extracted = oprate_calendar_data(ics_file = "../data/calender_data_2.ics")
-    print(f"Event data extracted: {event_data_extracted}")
+# if __name__ == "__main__":
+#     # Run the main calendar processing
+#     event_data_extracted = oprate_calendar_data(ics_file = "../data/calender_data_2.ics")
+#     print(f"Event data extracted: {event_data_extracted}")
