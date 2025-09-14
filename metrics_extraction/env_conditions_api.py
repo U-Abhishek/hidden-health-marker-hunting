@@ -37,10 +37,11 @@ import os
 import math
 import asyncio
 from datetime import datetime, date as date_cls, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 import httpx
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from dateutil import tz
 
@@ -73,14 +74,14 @@ def _parse_date(d: Optional[str]) -> date_cls:
         raise HTTPException(status_code=400, detail=f"Invalid date format. Use YYYY-MM-DD. ({e})")
 
 
-def _day_utc_window(day: date_cls) -> tuple[datetime, datetime]:
+def _day_utc_window(day: date_cls) -> Tuple[datetime, datetime]:
     # Represent the given calendar date as a UTC window [start, end)
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     return start, end
 
 
-def _closest_hour_idx(times: list[str], target_iso: str) -> int:
+def _closest_hour_idx(times: List[str], target_iso: str) -> int:
     # times are ISO8601 strings; return index closest to target
     t_target = datetime.fromisoformat(target_iso.replace("Z", "+00:00"))
     diffs = []
@@ -92,9 +93,9 @@ def _closest_hour_idx(times: list[str], target_iso: str) -> int:
 
 
 async def fetch_google_air_quality(lat: float, lon: float, day: date_cls, *, client: httpx.AsyncClient) -> Dict[str, Any]:
-    key = os.getenv("GOOGLE_MAPS_API_KEY")
+    key = os.getenv("GOOGLE_MAPS_API")
     if not key:
-        return {"error": "Missing GOOGLE_MAPS_API_KEY"}
+        return {"error": "Missing GOOGLE_MAPS_API"}
 
     start_utc, end_utc = _day_utc_window(day)
     now_utc = datetime.now(timezone.utc)
@@ -112,22 +113,38 @@ async def fetch_google_air_quality(lat: float, lon: float, day: date_cls, *, cli
         ],
     }
 
+    headers = {
+        # Prefer header-based auth per Google guidance
+        "X-Goog-Api-Key": key,
+        "Content-Type": "application/json",
+    }
+
     out: Dict[str, Any] = {"used": []}
+
+    async def _post(path: str, json_body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
+        url = f"{GOOGLE_AIR_BASE}/{path}"
+        try:
+            r = await client.post(url, headers=headers, json=json_body, timeout=timeout)
+            if r.status_code >= 400:
+                # Surface Google error details to aid debugging
+                try:
+                    err = r.json()
+                except Exception:
+                    err = {"text": r.text}
+                raise httpx.HTTPStatusError(
+                    f"{r.status_code} {r.reason_phrase}", request=r.request, response=r
+                )
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            return {"http_error": f"{e.response.status_code} {e.response.reason_phrase}", "body": e.response.text}
+        except Exception as e:
+            return {"error": str(e)}
 
     # 1) current conditions (only if the requested day is today)
     if start_utc.date() == now_utc.date():
-        try:
-            r = await client.post(
-                f"{GOOGLE_AIR_BASE}/currentConditions:lookup",
-                params={"key": key},
-                json=payload_common,
-                timeout=15,
-            )
-            r.raise_for_status()
-            out["current"] = r.json()
+        out["current"] = await _post("currentConditions:lookup", payload_common, timeout=15)
+        if "error" not in out["current"] and "http_error" not in out["current"]:
             out["used"].append("currentConditions:lookup")
-        except Exception as e:
-            out["current_error"] = str(e)
 
     # 2) history (if within past 30 days)
     if end_utc <= now_utc and (now_utc - start_utc) <= timedelta(days=30):
@@ -139,40 +156,17 @@ async def fetch_google_air_quality(lat: float, lon: float, day: date_cls, *, cli
             },
             "pageSize": 200,
         }
-        try:
-            r = await client.post(
-                f"{GOOGLE_AIR_BASE}/history:lookup",
-                params={"key": key},
-                json=body,
-                timeout=20,
-            )
-            r.raise_for_status()
-            out["history"] = r.json()
+        out["history"] = await _post("history:lookup", body)
+        if "error" not in out["history"] and "http_error" not in out["history"]:
             out["used"].append("history:lookup")
-        except Exception as e:
-            out["history_error"] = str(e)
 
     # 3) forecast (if today/future within 96h)
     if start_utc >= now_utc - timedelta(hours=1):
-        # The API needs a start dateTime in the future for forecast; we use the next hour if start is in the past.
         start_dt = max(now_utc + timedelta(hours=1), start_utc)
-        body = {
-            **payload_common,
-            "dateTime": start_dt.isoformat().replace("+00:00", "Z"),
-            "pageSize": 200,
-        }
-        try:
-            r = await client.post(
-                f"{GOOGLE_AIR_BASE}/forecast:lookup",
-                params={"key": key},
-                json=body,
-                timeout=20,
-            )
-            r.raise_for_status()
-            out["forecast"] = r.json()
+        body = {**payload_common, "dateTime": start_dt.isoformat().replace("+00:00", "Z"), "pageSize": 200}
+        out["forecast"] = await _post("forecast:lookup", body)
+        if "error" not in out["forecast"] and "http_error" not in out["forecast"]:
             out["used"].append("forecast:lookup")
-        except Exception as e:
-            out["forecast_error"] = str(e)
 
     return out
 
@@ -301,6 +295,27 @@ async def get_environment(
             "open_meteo": (OPEN_METEO_FORECAST if d >= datetime.now(timezone.utc).date() else OPEN_METEO_HISTORICAL),
             "openuv": OPENUV_BASE,
         },
+    )
+
+
+# Root landing page
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return (
+        """
+        <html>
+          <head><title>Environmental Conditions API</title></head>
+          <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; line-height:1.4; padding: 1rem 1.25rem;">
+            <h1>Environmental Conditions API</h1>
+            <p>This service aggregates Google Air Quality, Open‑Meteo weather, and optional OpenUV data.</p>
+            <ul>
+              <li><a href="/docs">Interactive API docs</a></li>
+              <li><a href="/healthz">Health check</a></li>
+              <li>Example: <a href="/env?lat=40.7128&lon=-74.0060&date=2025-09-14">/env?lat=40.7128&lon=-74.0060&date=2025-09-14</a></li>
+            </ul>
+          </body>
+        </html>
+        """
     )
 
 
